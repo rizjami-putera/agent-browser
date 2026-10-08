@@ -10186,6 +10186,211 @@ async fn e2e_cleared_session_setup_is_not_pending() {
     assert_success(&resp);
 }
 
+async fn evaluate_number(state: &mut DaemonState, id: &str, script: &str) -> f64 {
+    let resp = execute_command(
+        &json!({ "id": id, "action": "evaluate", "script": script }),
+        state,
+    )
+    .await;
+    assert_success(&resp);
+    get_data(&resp)["result"]
+        .as_f64()
+        .unwrap_or_else(|| panic!("expected a number from {script}: {resp}"))
+}
+
+/// `set network` delays real requests, keeps working when `set offline`
+/// toggles, and is replayed onto new tabs.
+#[tokio::test]
+#[ignore]
+async fn e2e_network_throttle_survives_offline_toggle_and_new_tabs() {
+    let (base_url, server) = start_echo_server().await;
+    let mut state = DaemonState::new();
+    // Milliseconds for one uncached same-origin request to the echo server.
+    let fetch_ms = "(async () => { const t = performance.now(); await (await fetch('/?' + Math.random(), { cache: 'no-store' })).text(); return performance.now() - t; })()";
+    // The slow-4g preset adds 562.5 ms of latency to every request.
+    let throttled_ms = 500.0;
+
+    let resp = execute_command(
+        &json!({ "id": "1", "action": "launch", "headless": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let resp = execute_command(
+        &json!({ "id": "2", "action": "navigate", "url": base_url }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    // A missing `throttle` key or 0 throughput (unlimited in Chrome) is
+    // rejected instead of silently clearing or faking a throttle.
+    for (id, cmd) in [
+        ("2a", json!({ "action": "network_throttle" })),
+        (
+            "2b",
+            json!({ "action": "network_throttle", "throttle": { "latencyMs": 100, "downloadBytesPerSec": 0, "uploadBytesPerSec": 1000 } }),
+        ),
+    ] {
+        let mut cmd = cmd;
+        cmd["id"] = json!(id);
+        let resp = execute_command(&cmd, &mut state).await;
+        assert_eq!(resp["success"], json!(false), "{resp}");
+    }
+    assert!(state.session_setup.network_throttle.is_none());
+
+    let resp = execute_command(
+        &json!({ "id": "3", "action": "network_throttle", "throttle": { "latencyMs": 562.5, "downloadBytesPerSec": 180000, "uploadBytesPerSec": 84375 } }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let ms = evaluate_number(&mut state, "4", fetch_ms).await;
+    assert!(ms >= throttled_ms, "throttled fetch took {ms} ms");
+
+    for (id, offline) in [("5", true), ("6", false)] {
+        let resp = execute_command(
+            &json!({ "id": id, "action": "offline", "offline": offline }),
+            &mut state,
+        )
+        .await;
+        assert_success(&resp);
+    }
+    let ms = evaluate_number(&mut state, "7", fetch_ms).await;
+    assert!(
+        ms >= throttled_ms,
+        "fetch after offline toggle took {ms} ms"
+    );
+
+    let resp = execute_command(
+        &json!({ "id": "8", "action": "tab_new", "url": base_url }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let ms = evaluate_number(&mut state, "9", fetch_ms).await;
+    assert!(ms >= throttled_ms, "fetch in new tab took {ms} ms");
+
+    let resp = execute_command(
+        &json!({ "id": "10", "action": "network_throttle", "throttle": null }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert!(state.session_setup.network_throttle.is_none());
+    let ms = evaluate_number(&mut state, "11", fetch_ms).await;
+    assert!(ms < throttled_ms, "unthrottled fetch took {ms} ms");
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+    server.abort();
+}
+
+/// `set cpu` slows page JavaScript, survives navigation, and `cpu 1` clears
+/// it.
+#[tokio::test]
+#[ignore]
+async fn e2e_cpu_throttle_slows_page_javascript() {
+    let mut state = DaemonState::new();
+    // Median of several runs of a fixed busy loop, in milliseconds.
+    let workload = "(() => { const runs = []; for (let r = 0; r < 5; r++) { const t = performance.now(); let x = 0; for (let i = 0; i < 2e6; i++) { x += Math.sqrt(i); } runs.push(performance.now() - t + (x < 0 ? 1 : 0)); } runs.sort((a, b) => a - b); return runs[2]; })()";
+
+    let resp = execute_command(
+        &json!({ "id": "1", "action": "launch", "headless": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    // Warm up so the JIT has optimized the loop before the baseline.
+    for id in ["2a", "2b"] {
+        evaluate_number(&mut state, id, workload).await;
+    }
+    let baseline = evaluate_number(&mut state, "2", workload).await;
+
+    let resp = execute_command(
+        &json!({ "id": "3", "action": "cpu_throttle", "rate": 6 }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    // The documented workflow throttles before navigating, so measure on a
+    // freshly loaded document.
+    let resp = execute_command(
+        &json!({ "id": "4a", "action": "navigate", "url": "data:text/html,<p>throttled</p>" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    for id in ["4b", "4c"] {
+        evaluate_number(&mut state, id, workload).await;
+    }
+    let throttled = evaluate_number(&mut state, "4", workload).await;
+    assert!(
+        throttled > baseline * 2.0,
+        "expected a slowdown: baseline {baseline} ms, throttled {throttled} ms"
+    );
+
+    let resp = execute_command(
+        &json!({ "id": "5", "action": "cpu_throttle", "rate": 1 }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert!(state.session_setup.cpu_throttling_rate.is_none());
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+}
+
+/// `gc` collects garbage the page has dropped and returns the JS heap size.
+#[tokio::test]
+#[ignore]
+async fn e2e_gc_collects_unreachable_objects() {
+    let mut state = DaemonState::new();
+
+    let resp = execute_command(
+        &json!({ "id": "1", "action": "launch", "headless": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    // Only a WeakRef points at the array, so a full GC must clear it.
+    assert_evaluate(
+        &mut state,
+        "2",
+        "(() => { window.__gcProbe = new WeakRef(new Array(1e5).fill(1)); return true; })()",
+        json!(true),
+    )
+    .await;
+    assert_evaluate(
+        &mut state,
+        "3",
+        "window.__gcProbe.deref() !== undefined",
+        json!(true),
+    )
+    .await;
+
+    let resp = execute_command(&json!({ "id": "4", "action": "gc" }), &mut state).await;
+    assert_success(&resp);
+    let used = get_data(&resp)["usedSize"].as_f64().expect("usedSize");
+    let total = get_data(&resp)["totalSize"].as_f64().expect("totalSize");
+    assert!(used > 0.0 && used <= total, "used {used}, total {total}");
+
+    assert_evaluate(
+        &mut state,
+        "5",
+        "window.__gcProbe.deref() === undefined",
+        json!(true),
+    )
+    .await;
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+}
+
 /// The launch `--user-agent` (Emulation.setUserAgentOverride) and global
 /// `set headers` (Network.setExtraHTTPHeaders) are per CDP session. A new tab
 /// opened with a URL must send both on its very first document request.

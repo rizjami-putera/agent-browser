@@ -458,6 +458,7 @@ const ALLOWED_COMMANDS: &[&str] = &[
     "react",
     "vitals",
     "web-vitals",
+    "gc",
     "pushstate",
     "removeinitscript",
     "skills",

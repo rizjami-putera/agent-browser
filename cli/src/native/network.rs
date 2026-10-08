@@ -25,19 +25,64 @@ pub async fn set_extra_headers(
     Ok(())
 }
 
-pub async fn set_offline(
+/// Network throttling applied with `Network.emulateNetworkConditions`.
+///
+/// Throughput is in bytes per second, matching the CDP parameters.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct NetworkThrottle {
+    pub latency_ms: f64,
+    pub download_bytes_per_sec: f64,
+    pub upload_bytes_per_sec: f64,
+}
+
+impl NetworkThrottle {
+    /// Presets with the same values as the Chrome DevTools network panel.
+    /// `fast-3g` is the old DevTools name of `slow-4g`, and `slow-3g` the old
+    /// name of `3g`.
+    pub fn preset(name: &str) -> Option<Self> {
+        let (latency_ms, download_bytes_per_sec, upload_bytes_per_sec) =
+            match name.to_ascii_lowercase().as_str() {
+                "3g" | "slow-3g" => (2000.0, 50_000.0, 50_000.0),
+                "slow-4g" | "fast-3g" => (562.5, 180_000.0, 84_375.0),
+                "fast-4g" => (165.0, 1_012_500.0, 168_750.0),
+                _ => return None,
+            };
+        Some(Self {
+            latency_ms,
+            download_bytes_per_sec,
+            upload_bytes_per_sec,
+        })
+    }
+}
+
+/// Apply offline mode and network throttling in one call.
+///
+/// Both share `Network.emulateNetworkConditions`, and each call replaces the
+/// previous conditions, so callers pass the full desired state to keep
+/// `set offline` and `set network` from clearing each other.
+pub async fn emulate_network_conditions(
     client: &CdpClient,
     session_id: &str,
     offline: bool,
+    throttle: Option<NetworkThrottle>,
 ) -> Result<(), String> {
+    let (latency, download, upload) = throttle
+        .map(|t| {
+            (
+                t.latency_ms,
+                t.download_bytes_per_sec,
+                t.upload_bytes_per_sec,
+            )
+        })
+        .unwrap_or((0.0, -1.0, -1.0));
     client
         .send_command(
             "Network.emulateNetworkConditions",
             Some(json!({
                 "offline": offline,
-                "latency": 0,
-                "downloadThroughput": -1,
-                "uploadThroughput": -1,
+                "latency": latency,
+                "downloadThroughput": download,
+                "uploadThroughput": upload,
             })),
             Some(session_id),
         )
@@ -662,6 +707,23 @@ impl EventTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_network_throttle_presets_match_devtools() {
+        let slow_4g = NetworkThrottle::preset("slow-4g").unwrap();
+        assert_eq!(slow_4g.latency_ms, 562.5);
+        assert_eq!(slow_4g.download_bytes_per_sec, 180_000.0);
+        assert_eq!(slow_4g.upload_bytes_per_sec, 84_375.0);
+        assert_eq!(NetworkThrottle::preset("fast-3g"), Some(slow_4g));
+        assert_eq!(
+            NetworkThrottle::preset("3g"),
+            NetworkThrottle::preset("Slow-3G")
+        );
+        assert!(NetworkThrottle::preset("5g").is_none());
+        for name in ["3g", "slow-4g", "fast-4g"] {
+            assert!(NetworkThrottle::preset(name).is_some(), "{name}");
+        }
+    }
 
     #[test]
     fn test_domain_filter_exact() {

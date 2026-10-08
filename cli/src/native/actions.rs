@@ -486,6 +486,12 @@ pub struct SessionSetup {
     /// `DaemonState::origin_headers`.
     pub extra_headers: Option<HashMap<String, String>>,
     pub offline: Option<bool>,
+    /// `set network` throttling. Shares `Network.emulateNetworkConditions`
+    /// with `offline`, so both are always applied together.
+    pub network_throttle: Option<network::NetworkThrottle>,
+    /// `set cpu` slowdown factor (`Emulation.setCPUThrottlingRate`). `None`
+    /// when unthrottled.
+    pub cpu_throttling_rate: Option<f64>,
     /// Init scripts registered with `Page.addScriptToEvaluateOnNewDocument`:
     /// `--enable`, `--init-script`, plugin init scripts, and `addinitscript`.
     pub init_scripts: Vec<InitScriptSetup>,
@@ -516,6 +522,8 @@ impl SessionSetup {
             && self.geolocation.is_none()
             && self.extra_headers.as_ref().is_none_or(HashMap::is_empty)
             && !self.offline.unwrap_or(false)
+            && self.network_throttle.is_none()
+            && self.cpu_throttling_rate.is_none()
             && self.init_scripts.is_empty()
     }
 
@@ -3034,6 +3042,9 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
         "setcontent" => handle_setcontent(cmd, state).await,
         "headers" => handle_headers(cmd, state).await,
         "offline" => handle_offline(cmd, state).await,
+        "network_throttle" => handle_network_throttle(cmd, state).await,
+        "cpu_throttle" => handle_cpu_throttle(cmd, state).await,
+        "gc" => handle_gc(state).await,
         "console" => handle_console(cmd, state).await,
         "errors" => handle_errors(state).await,
         "session_info" => handle_session_info(state).await,
@@ -3979,8 +3990,24 @@ async fn apply_session_setup(state: &mut DaemonState, session_id: &str) -> Resul
         network::set_extra_headers(&client, session_id, headers).await?;
     }
 
-    if let Some(offline) = setup.offline {
-        network::set_offline(&client, session_id, offline).await?;
+    if setup.offline.is_some() || setup.network_throttle.is_some() {
+        network::emulate_network_conditions(
+            &client,
+            session_id,
+            setup.offline.unwrap_or(false),
+            setup.network_throttle,
+        )
+        .await?;
+    }
+
+    if let Some(rate) = setup.cpu_throttling_rate {
+        let _ = client
+            .send_command(
+                "Emulation.setCPUThrottlingRate",
+                Some(json!({ "rate": rate })),
+                Some(session_id),
+            )
+            .await;
     }
 
     for (index, script) in setup.init_scripts.iter().enumerate() {
@@ -7154,10 +7181,103 @@ async fn handle_offline(cmd: &Value, state: &mut DaemonState) -> Result<Value, S
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let session_id = mgr.active_session_id()?.to_string();
     let offline = cmd.get("offline").and_then(|v| v.as_bool()).unwrap_or(true);
-    network::set_offline(&mgr.client, &session_id, offline).await?;
+    network::emulate_network_conditions(
+        &mgr.client,
+        &session_id,
+        offline,
+        state.session_setup.network_throttle,
+    )
+    .await?;
     // Online is the default for a fresh target and needs no replay.
     state.session_setup.offline = offline.then_some(true);
     Ok(json!({ "offline": offline }))
+}
+
+/// `set network`: throttle latency and throughput, keeping any offline mode.
+/// `throttle: null` turns throttling off.
+async fn handle_network_throttle(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
+    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+    let session_id = mgr.active_session_id()?.to_string();
+    let throttle = match cmd.get("throttle").ok_or("Missing 'throttle' parameter")? {
+        Value::Null => None,
+        t => {
+            // Chrome treats 0 throughput as unlimited, so require > 0.
+            let field = |name: &str, min_exclusive: bool| {
+                t.get(name)
+                    .and_then(Value::as_f64)
+                    .filter(|v| v.is_finite() && *v >= 0.0 && !(min_exclusive && *v == 0.0))
+                    .ok_or(format!(
+                        "'throttle.{name}' must be a {} number",
+                        if min_exclusive {
+                            "positive"
+                        } else {
+                            "non-negative"
+                        }
+                    ))
+            };
+            Some(network::NetworkThrottle {
+                latency_ms: field("latencyMs", false)?,
+                download_bytes_per_sec: field("downloadBytesPerSec", true)?,
+                upload_bytes_per_sec: field("uploadBytesPerSec", true)?,
+            })
+        }
+    };
+    network::emulate_network_conditions(
+        &mgr.client,
+        &session_id,
+        state.session_setup.offline.unwrap_or(false),
+        throttle,
+    )
+    .await?;
+    state.session_setup.network_throttle = throttle;
+    Ok(match throttle {
+        Some(t) => json!({
+            "throttled": true,
+            "latencyMs": t.latency_ms,
+            "downloadBytesPerSec": t.download_bytes_per_sec,
+            "uploadBytesPerSec": t.upload_bytes_per_sec,
+        }),
+        None => json!({ "throttled": false }),
+    })
+}
+
+/// `set cpu`: slow the page CPU by `rate` (1 turns throttling off).
+async fn handle_cpu_throttle(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
+    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+    let session_id = mgr.active_session_id()?.to_string();
+    let rate = cmd
+        .get("rate")
+        .and_then(Value::as_f64)
+        .filter(|r| r.is_finite() && *r >= 1.0)
+        .ok_or("'rate' must be a number >= 1 (1 = no throttle)")?;
+    mgr.client
+        .send_command(
+            "Emulation.setCPUThrottlingRate",
+            Some(json!({ "rate": rate })),
+            Some(&session_id),
+        )
+        .await?;
+    // Rate 1 is the default for a fresh target and needs no replay.
+    state.session_setup.cpu_throttling_rate = (rate > 1.0).then_some(rate);
+    Ok(json!({ "rate": rate }))
+}
+
+/// `gc`: force a full garbage collection in the active page, then report the
+/// JS heap so memory readings are comparable between runs.
+async fn handle_gc(state: &DaemonState) -> Result<Value, String> {
+    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+    let session_id = mgr.active_session_id()?;
+    mgr.client
+        .send_command_no_params("HeapProfiler.collectGarbage", Some(session_id))
+        .await?;
+    let usage = mgr
+        .client
+        .send_command_no_params("Runtime.getHeapUsage", Some(session_id))
+        .await?;
+    Ok(json!({
+        "usedSize": usage.get("usedSize").cloned().unwrap_or(Value::Null),
+        "totalSize": usage.get("totalSize").cloned().unwrap_or(Value::Null),
+    }))
 }
 
 async fn handle_console(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
@@ -16314,6 +16434,19 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
             .as_mut()
             .unwrap()
             .insert("X-Test".to_string(), "set".to_string());
+        assert!(!setup.is_empty());
+    }
+
+    #[test]
+    fn test_session_setup_replays_throttling() {
+        let mut setup = SessionSetup {
+            cpu_throttling_rate: Some(4.0),
+            ..SessionSetup::default()
+        };
+        assert!(!setup.is_empty());
+
+        setup.cpu_throttling_rate = None;
+        setup.network_throttle = network::NetworkThrottle::preset("slow-4g");
         assert!(!setup.is_empty());
     }
 

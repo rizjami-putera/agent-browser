@@ -187,10 +187,30 @@ agent-browser set viewport <w> <h> [scale]  # Set viewport size (scale for retin
 agent-browser set device <name>       # Emulate device ("iPhone 14")
 agent-browser set geo <lat> <lng>     # Set geolocation
 agent-browser set offline [on|off]    # Toggle offline mode
+agent-browser set network <preset|off> # Throttle network (3g, slow-4g, fast-4g)
+agent-browser set network <ms> <down-kbps> [up-kbps]  # Custom throttling
+agent-browser set cpu <rate|off>      # Slow down the page CPU (4 = 4x)
 agent-browser set headers <json>      # Extra HTTP headers
 agent-browser set credentials <u> <p> # HTTP basic auth for current and future tabs
 agent-browser set media [dark|light]  # Emulate color scheme (persists for session)
 ```
+
+`set network` and `set cpu` emulate slower devices for performance measurements, like the Chrome DevTools throttling controls. Both apply to the current tab and tabs opened later, and `set offline` keeps any network throttling. The network presets use the DevTools values:
+
+<table>
+  <thead>
+    <tr><th>Preset</th><th>Latency</th><th>Download</th><th>Upload</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>3g</code></td><td>2000 ms</td><td>400 kbps</td><td>400 kbps</td></tr>
+    <tr><td><code>slow-4g</code> (formerly Fast 3G)</td><td>562.5 ms</td><td>1440 kbps</td><td>675 kbps</td></tr>
+    <tr><td><code>fast-4g</code></td><td>165 ms</td><td>8100 kbps</td><td>1350 kbps</td></tr>
+  </tbody>
+</table>
+
+A common mobile profile is `set viewport 375 812 3`, `set network slow-4g` and `set cpu 4`. Use `off` (or `set cpu 1`) to remove throttling.
+
+Use `agent-browser gc` before you read memory. It forces a full garbage collection in the active page and prints the remaining JS heap, so heap numbers from different runs are comparable.
 
 Use `--color-scheme` for persistent dark/light mode across all commands:
 
@@ -566,6 +586,7 @@ agent-browser react renders stop [--json]          # Stop + print profile
 agent-browser react suspense [--only-dynamic] [--json]  # Suspense boundaries + classifier
                                                          # --only-dynamic hides the "static" list
 agent-browser vitals [url] [--json]                # LCP/CLS/TTFB/FCP/INP + hydration
+agent-browser gc                                   # Force GC, print JS heap size
 ```
 
 Works on any React app (Next.js, Remix, Vite+React, CRA, TanStack Start, React Native Web, etc.). `vitals` and `pushstate` are framework-agnostic.
@@ -719,7 +740,7 @@ Example MCP client config:
 }
 ```
 
-With `--tools all`, the server exposes typed tools across the CLI command surface, including navigation, snapshots, input, waits, screenshots/PDF, get/is/find, mouse, network, storage, cookies, tabs, windows, frames, dialogs, tracing, recording, accessibility audits, clipboard, auth, state, iOS, diff, React, vitals, sessions, skills, plugins, doctor, dashboard, install, upgrade, chat, eval, and close.
+With `--tools all`, the server exposes typed tools across the CLI command surface, including navigation, snapshots, input, waits, screenshots/PDF, get/is/find, mouse, network, storage, cookies, tabs, windows, frames, dialogs, tracing, recording, accessibility audits, clipboard, auth, state, iOS, diff, React, vitals, CPU and network throttling, garbage collection, sessions, skills, plugins, doctor, dashboard, install, upgrade, chat, eval, and close.
 
 Common tools include:
 

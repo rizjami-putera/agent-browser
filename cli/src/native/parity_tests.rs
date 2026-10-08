@@ -81,6 +81,9 @@ const DOCUMENTED_ACTIONS: &[&str] = &[
     "setcontent",
     "headers",
     "offline",
+    "network_throttle",
+    "cpu_throttle",
+    "gc",
     "console",
     "errors",
     "state_save",
@@ -273,6 +276,12 @@ fn minimal_command(action: &str, id: &str) -> Value {
         }
         "offline" => {
             obj.insert("offline".to_string(), json!(false));
+        }
+        "network_throttle" => {
+            obj.insert("throttle".to_string(), json!(null));
+        }
+        "cpu_throttle" => {
+            obj.insert("rate".to_string(), json!(1));
         }
         "wait" => {
             obj.insert("timeout".to_string(), json!(100));

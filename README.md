@@ -330,12 +330,26 @@ agent-browser set viewport <w> <h> [scale]  # Set viewport size (scale for retin
 agent-browser set device <name>       # Emulate device ("iPhone 14")
 agent-browser set geo <lat> <lng>     # Set geolocation
 agent-browser set offline [on|off]    # Toggle offline mode
+agent-browser set network <preset|off> # Throttle network (3g, slow-4g, fast-4g)
+agent-browser set network <ms> <down-kbps> [up-kbps]  # Custom throttling
+agent-browser set cpu <rate|off>      # Slow down the page CPU (4 = 4x)
 agent-browser set headers <json>      # Extra HTTP headers
 agent-browser set credentials <u> <p> # HTTP basic auth for current and future tabs
 agent-browser set media [dark|light]  # Emulate color scheme
 ```
 
 `set credentials` applies HTTP Basic Authentication to the current tab and tabs opened later. `set offline off` and `set headers '{}'` restore the default setup for future tabs.
+
+`set network` and `set cpu` emulate slower devices for performance measurements, like the Chrome DevTools throttling controls. The network presets use the same values as DevTools: `3g` (2000 ms latency, 400 kbps down and up), `slow-4g` (562.5 ms, 1440 kbps down, 675 kbps up; formerly "Fast 3G") and `fast-4g` (165 ms, 8100 kbps down, 1350 kbps up). Both settings apply to the current tab and tabs opened later, and `set offline` keeps any network throttling. Use `off` (or `set cpu 1`) to turn them off. A common mobile profile is:
+
+```bash
+agent-browser set viewport 375 812 3
+agent-browser set network slow-4g
+agent-browser set cpu 4
+agent-browser open https://example.com && agent-browser vitals
+```
+
+Use `agent-browser gc` before you read memory: it forces a full garbage collection in the active page and prints the remaining JS heap, so heap numbers from different runs are comparable.
 
 ### Cookies & Storage
 

@@ -78,6 +78,9 @@ const TOOL_SET_VIEWPORT: &str = "agent_browser_set_viewport";
 const TOOL_SET_DEVICE: &str = "agent_browser_set_device";
 const TOOL_SET_GEO: &str = "agent_browser_set_geo";
 const TOOL_SET_OFFLINE: &str = "agent_browser_set_offline";
+const TOOL_SET_NETWORK: &str = "agent_browser_set_network";
+const TOOL_SET_CPU: &str = "agent_browser_set_cpu";
+const TOOL_GC: &str = "agent_browser_gc";
 const TOOL_SET_HEADERS: &str = "agent_browser_set_headers";
 const TOOL_SET_CREDENTIALS: &str = "agent_browser_set_credentials";
 const TOOL_SET_MEDIA: &str = "agent_browser_set_media";
@@ -379,6 +382,7 @@ const NETWORK_PROFILE_TOOLS: &[&str] = &[
     TOOL_SET_HEADERS,
     TOOL_SET_CREDENTIALS,
     TOOL_SET_OFFLINE,
+    TOOL_SET_NETWORK,
     TOOL_NETWORK_ROUTE,
     TOOL_NETWORK_UNROUTE,
     TOOL_NETWORK_REQUESTS,
@@ -426,6 +430,7 @@ const DEBUG_PROFILE_TOOLS: &[&str] = &[
     TOOL_TRACE_STOP,
     TOOL_PROFILER_START,
     TOOL_PROFILER_STOP,
+    TOOL_GC,
     TOOL_RECORD_START,
     TOOL_RECORD_STOP,
     TOOL_RECORD_RESTART,
@@ -483,6 +488,9 @@ const REACT_PROFILE_TOOLS: &[&str] = &[
     TOOL_REACT_RENDERS_STOP,
     TOOL_REACT_SUSPENSE,
     TOOL_VITALS,
+    TOOL_SET_NETWORK,
+    TOOL_SET_CPU,
+    TOOL_GC,
     TOOL_PUSHSTATE,
     TOOL_REMOVE_INIT_SCRIPT,
 ];
@@ -500,6 +508,7 @@ const MOBILE_PROFILE_TOOLS: &[&str] = &[
     TOOL_SET_DEVICE,
     TOOL_SET_GEO,
     TOOL_SET_MEDIA,
+    TOOL_SET_CPU,
     TOOL_TAP,
     TOOL_SWIPE,
     TOOL_DEVICE,
@@ -1176,6 +1185,25 @@ fn parity_tools() -> Vec<Value> {
             &["enabled"],
         ),
         tool(
+            TOOL_SET_NETWORK,
+            "Set network throttling",
+            "Throttle the network for the current tab and tabs opened later. Use a Chrome DevTools preset (3g, slow-4g, fast-4g), off, or custom latencyMs plus downloadKbps (and optional uploadKbps).",
+            json!({
+                "preset": { "type": "string", "enum": ["3g", "slow-4g", "fast-4g", "off"] },
+                "latencyMs": number_schema(),
+                "downloadKbps": number_schema(),
+                "uploadKbps": number_schema()
+            }),
+            &[],
+        ),
+        tool(
+            TOOL_SET_CPU,
+            "Set CPU throttling",
+            "Slow down the page CPU for the current tab and tabs opened later. rate is a slowdown factor: 4 is the common mobile profile, 1 turns throttling off.",
+            json!({ "rate": number_schema() }),
+            &["rate"],
+        ),
+        tool(
             TOOL_SET_HEADERS,
             "Set headers",
             "Set extra HTTP headers from a JSON object.",
@@ -1377,6 +1405,13 @@ fn parity_tools() -> Vec<Value> {
             "Profiler stop",
             "Stop profiler capture.",
             json!({ "path": { "type": "string" } }),
+            &[],
+        ),
+        tool(
+            TOOL_GC,
+            "Garbage collect",
+            "Force a full garbage collection in the active page and return the JS heap size (usedSize, totalSize in bytes), so memory readings are comparable between runs.",
+            json!({}),
             &[],
         ),
         tool(
@@ -2279,6 +2314,17 @@ fn call_tool(params: Option<&Value>, config: &McpConfig) -> Result<Value, Protoc
         TOOL_SET_DEVICE => call_one_string(arguments, "set device", "device"),
         TOOL_SET_GEO => call_set_geo(arguments),
         TOOL_SET_OFFLINE => call_set_bool(arguments, "offline", "enabled"),
+        TOOL_SET_NETWORK => call_set_network(arguments),
+        TOOL_SET_CPU => call_cli_tool(
+            arguments,
+            vec![
+                "set".to_string(),
+                "cpu".to_string(),
+                required_number_string(arguments, "rate")?,
+            ],
+            None,
+        ),
+        TOOL_GC => call_cli_tool(arguments, vec!["gc".to_string()], None),
         TOOL_SET_HEADERS => call_set_headers(arguments),
         TOOL_SET_CREDENTIALS => call_set_credentials(arguments),
         TOOL_SET_MEDIA => call_set_media(arguments),
@@ -2960,6 +3006,33 @@ fn call_set_geo(arguments: &Value) -> Result<Value, ProtocolError> {
         vec!["set".to_string(), "geo".to_string(), latitude, longitude],
         None,
     )
+}
+
+/// `set network`: a preset (or `off`) wins; otherwise custom latency and
+/// throughput, mirroring the CLI argument order.
+fn call_set_network(arguments: &Value) -> Result<Value, ProtocolError> {
+    call_cli_tool(arguments, set_network_args(arguments)?, None)
+}
+
+fn set_network_args(arguments: &Value) -> Result<Vec<String>, ProtocolError> {
+    let mut args = vec!["set".to_string(), "network".to_string()];
+    if let Some(preset) = optional_string(arguments, "preset")? {
+        args.push(preset);
+    } else {
+        let latency = optional_number_string(arguments, "latencyMs")?;
+        let download = optional_number_string(arguments, "downloadKbps")?;
+        let (Some(latency), Some(download)) = (latency, download) else {
+            return Err(ProtocolError::invalid_params(
+                "pass preset, or latencyMs and downloadKbps",
+            ));
+        };
+        args.push(latency);
+        args.push(download);
+        if let Some(upload) = optional_number_string(arguments, "uploadKbps")? {
+            args.push(upload);
+        }
+    }
+    Ok(args)
 }
 
 fn call_set_bool(arguments: &Value, setting: &str, key: &str) -> Result<Value, ProtocolError> {
@@ -4518,6 +4591,46 @@ mod tests {
         assert!(!names.contains(&TOOL_PLUGIN_LIST));
         assert!(!names.contains(&TOOL_REACT_TREE));
         assert!(result.get("nextCursor").is_none());
+    }
+
+    #[test]
+    fn set_network_options_use_cli_parser() {
+        let cases = [
+            (
+                json!({ "preset": "slow-4g" }),
+                json!({ "latencyMs": 562.5, "downloadBytesPerSec": 180_000.0, "uploadBytesPerSec": 84_375.0 }),
+            ),
+            (
+                json!({ "latencyMs": 150, "downloadKbps": 1600, "uploadKbps": 750 }),
+                json!({ "latencyMs": 150.0, "downloadBytesPerSec": 200_000.0, "uploadBytesPerSec": 93_750.0 }),
+            ),
+            (json!({ "preset": "off" }), Value::Null),
+        ];
+        for (arguments, throttle) in cases {
+            let args = set_network_args(&arguments).unwrap();
+            let flags = crate::flags::parse_flags(&args);
+            let command = crate::commands::parse_command(&args, &flags).unwrap();
+            assert_eq!(command["action"], "network_throttle");
+            assert_eq!(command["throttle"], throttle);
+        }
+    }
+
+    #[test]
+    fn set_network_requires_preset_or_latency_and_download() {
+        assert!(set_network_args(&json!({})).is_err());
+        assert!(set_network_args(&json!({ "latencyMs": 150 })).is_err());
+    }
+
+    #[test]
+    fn throttle_and_gc_tools_are_in_their_profiles() {
+        assert!(NETWORK_PROFILE_TOOLS.contains(&TOOL_SET_NETWORK));
+        assert!(MOBILE_PROFILE_TOOLS.contains(&TOOL_SET_CPU));
+        assert!(DEBUG_PROFILE_TOOLS.contains(&TOOL_GC));
+        // `vitals` lives in the react profile; measuring it on mobile needs
+        // the throttles in the same profile.
+        for tool in [TOOL_SET_NETWORK, TOOL_SET_CPU, TOOL_GC] {
+            assert!(REACT_PROFILE_TOOLS.contains(&tool), "{tool}");
+        }
     }
 
     #[test]

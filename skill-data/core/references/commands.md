@@ -191,11 +191,18 @@ agent-browser set viewport 1920 1080 2        # 2x retina (same CSS size, higher
 agent-browser set device "iPhone 14"          # Emulate device
 agent-browser set geo 37.7749 -122.4194       # Set geolocation (alias: geolocation)
 agent-browser set offline on                  # Toggle offline mode
+agent-browser set network slow-4g             # Throttle network (3g, slow-4g, fast-4g, off)
+agent-browser set network 150 1600 750        # Custom: latency ms, down kbps, up kbps
+agent-browser set cpu 4                       # 4x CPU slowdown (off or 1 to reset)
 agent-browser set headers '{"X-Key":"v"}'     # Extra HTTP headers
 agent-browser set credentials user pass       # HTTP basic auth for current and future tabs (alias: auth)
 agent-browser set media dark                  # Emulate color scheme
 agent-browser set media light reduced-motion  # Light mode + reduced motion
 ```
+
+For mobile performance numbers, emulate the device before you navigate: `set viewport 375 812 3`, `set network slow-4g`, `set cpu 4`. Without throttling, a desktop machine reports far better timings than a real phone. Network and CPU throttling apply to tabs opened later, and `set offline` keeps the network throttling.
+
+For memory checks, run `agent-browser gc` before each heap reading. It forces a full garbage collection in the active page and prints the remaining JS heap (`--json` gives `usedSize` and `totalSize` in bytes). Heap growth without a forced GC is not evidence of a leak.
 
 ## Cookies and Storage
 
@@ -496,6 +503,7 @@ agent-browser react renders stop [--json]           # Stop and print render prof
 agent-browser react suspense [--only-dynamic] [--json]  # Suspense boundaries + classifier
                                                          # --only-dynamic hides the "static" list
 agent-browser vitals [url] [--json]                 # LCP/CLS/TTFB/FCP/INP + hydration
+agent-browser gc                                    # Force GC, print JS heap size
 agent-browser pushstate <url>                       # SPA client-side nav (auto-detects Next router)
 ```
 

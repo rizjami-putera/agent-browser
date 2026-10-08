@@ -540,9 +540,12 @@ agent-browser react renders stop                 # print render profile
 agent-browser react suspense [--only-dynamic]    # Suspense boundaries + classifier
 agent-browser vitals [url]                       # LCP/CLS/TTFB/FCP/INP + hydration
 agent-browser pushstate <url>                    # SPA navigation (auto-detects Next router)
+agent-browser gc                                 # force GC, print JS heap size
 ```
 
 Without `--enable react-devtools`, the `react …` commands error. `vitals` and `pushstate` work on any site regardless of framework. `vitals` prints a summary by default; use `--json` for the full structured payload.
+
+For mobile numbers, throttle before you navigate and run `vitals`: `set viewport 375 812 3`, `set network slow-4g`, `set cpu 4`. Unthrottled timings from a desktop machine are far better than a real phone. For memory checks, run `gc` before each heap reading. See `references/commands.md` (Browser Settings) for presets and custom values.
 
 ## Working safely
 

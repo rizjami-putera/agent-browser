@@ -312,6 +312,53 @@ fn truncate_field(value: &str, max_chars: usize) -> String {
     truncated
 }
 
+/// Text for `set cpu`, `set network`, and `gc` results.
+fn format_emulation_text(action: Option<&str>, data: &serde_json::Value) -> Option<String> {
+    let mb = |key: &str| {
+        data.get(key)
+            .and_then(|v| v.as_f64())
+            .map(|bytes| format!("{:.1} MB", bytes / 1_000_000.0))
+            .unwrap_or_else(|| "-".to_string())
+    };
+    match action? {
+        "cpu_throttle" => {
+            let rate = data.get("rate").and_then(|v| v.as_f64())?;
+            Some(if rate > 1.0 {
+                format!("CPU throttled {}x", rate)
+            } else {
+                "CPU throttling off".to_string()
+            })
+        }
+        "network_throttle" => {
+            if !data.get("throttled").and_then(|v| v.as_bool())? {
+                return Some("Network throttling off".to_string());
+            }
+            let kbps = |key: &str| {
+                data.get(key)
+                    .and_then(|v| v.as_f64())
+                    .map(|bytes_per_sec| bytes_per_sec * 8.0 / 1000.0)
+                    .unwrap_or(0.0)
+            };
+            let latency = data
+                .get("latencyMs")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+            Some(format!(
+                "Network throttled: {} ms latency, {} kbps down, {} kbps up",
+                latency,
+                kbps("downloadBytesPerSec"),
+                kbps("uploadBytesPerSec")
+            ))
+        }
+        "gc" => Some(format!(
+            "Garbage collected. JS heap: {} used / {} total",
+            mb("usedSize"),
+            mb("totalSize")
+        )),
+        _ => None,
+    }
+}
+
 fn format_vitals_text(data: &serde_json::Value) -> String {
     let url = data.get("url").and_then(|v| v.as_str()).unwrap_or("-");
     let ttfb = format_metric_ms(data.get("ttfb").and_then(|v| v.as_f64()));
@@ -597,6 +644,10 @@ fn print_primary_response(resp: &Response, action: Option<&str>, opts: &OutputOp
         }
         if action == Some("vitals") {
             println!("{}", format_vitals_text(data));
+            return;
+        }
+        if let Some(output) = format_emulation_text(action, data) {
+            println!("{} {}", color::success_indicator(), output);
             return;
         }
         if action == Some("a11y") {
@@ -2497,6 +2548,13 @@ Settings:
   device <name>              Emulate device (e.g., "iPhone 12")
   geo <lat> <lng>            Set geolocation
   offline [on|off]           Toggle offline mode; off restores the new-tab default
+  network <preset|off>       Throttle the network like Chrome DevTools; presets:
+                             3g (2000 ms, 400/400 kbps), slow-4g (562.5 ms,
+                             1440/675 kbps), fast-4g (165 ms, 8100/1350 kbps)
+  network <ms> <down> [up]   Custom latency (ms) and throughput (kbps)
+  cpu <rate|off>             Slow down the page CPU (4 = 4x slowdown; 1 or off
+                             turns it off). Network and CPU throttling also
+                             apply to tabs opened later
   headers <json>             Set extra HTTP headers; use {} to clear them for new tabs
   credentials <user> <pass>  Set HTTP authentication for current and future tabs
   media [dark|light]         Set color scheme preference
@@ -2512,6 +2570,10 @@ Examples:
   agent-browser set device "iPhone 12"
   agent-browser set geo 37.7749 -122.4194
   agent-browser set offline on
+  agent-browser set network slow-4g
+  agent-browser set network 150 1600 750
+  agent-browser set cpu 4                   # mobile profile: with slow-4g
+  agent-browser set cpu off
   agent-browser set headers '{"X-Custom": "value"}'
   agent-browser set credentials admin secret123
   agent-browser set media dark
@@ -3864,7 +3926,8 @@ Mouse:  agent-browser mouse <action> [args]
 
 Browser Settings:  agent-browser set <setting> [value]
   viewport <w> <h>, device <name>, geo <lat> <lng>
-  offline [on|off], headers <json>, credentials <user> <pass>
+  offline [on|off], network <preset|off>, cpu <rate|off>
+  headers <json>, credentials <user> <pass>
   media [dark|light] [reduced-motion]
 
 Network:  agent-browser network <action>
@@ -3923,6 +3986,8 @@ React (requires `open --enable react-devtools`):
 Performance:
   vitals [url] [--json]      Core Web Vitals (LCP/CLS/TTFB/FCP/INP) +
                              React hydration summary; --json returns full data
+  gc                         Force garbage collection, then print the JS heap
+                             size (compare memory between runs)
 
 Accessibility:
   a11y [url] [--tags <t1,t2>] [--selector <css>] [--json]
@@ -4331,11 +4396,50 @@ pub fn print_version() {
 #[cfg(test)]
 mod tests {
     use super::{
-        boundary_origin, format_a11y_text, format_snapshot_delta, format_storage_text,
-        format_vitals_text, format_webmcp_context, format_webmcp_text, format_webmcp_tool_text,
-        format_with_boundaries, OutputOptions,
+        boundary_origin, format_a11y_text, format_emulation_text, format_snapshot_delta,
+        format_storage_text, format_vitals_text, format_webmcp_context, format_webmcp_text,
+        format_webmcp_tool_text, format_with_boundaries, OutputOptions,
     };
     use serde_json::json;
+
+    #[test]
+    fn test_format_emulation_text() {
+        assert_eq!(
+            format_emulation_text(Some("cpu_throttle"), &json!({ "rate": 4.0 })).unwrap(),
+            "CPU throttled 4x"
+        );
+        assert_eq!(
+            format_emulation_text(Some("cpu_throttle"), &json!({ "rate": 1.0 })).unwrap(),
+            "CPU throttling off"
+        );
+        assert_eq!(
+            format_emulation_text(
+                Some("network_throttle"),
+                &json!({
+                    "throttled": true,
+                    "latencyMs": 562.5,
+                    "downloadBytesPerSec": 180_000.0,
+                    "uploadBytesPerSec": 84_375.0,
+                })
+            )
+            .unwrap(),
+            "Network throttled: 562.5 ms latency, 1440 kbps down, 675 kbps up"
+        );
+        assert_eq!(
+            format_emulation_text(Some("network_throttle"), &json!({ "throttled": false }))
+                .unwrap(),
+            "Network throttling off"
+        );
+        assert_eq!(
+            format_emulation_text(
+                Some("gc"),
+                &json!({ "usedSize": 12_345_678.0, "totalSize": 20_000_000.0 })
+            )
+            .unwrap(),
+            "Garbage collected. JS heap: 12.3 MB used / 20.0 MB total"
+        );
+        assert!(format_emulation_text(Some("offline"), &json!({ "offline": true })).is_none());
+    }
 
     #[test]
     fn test_format_stream_status_text_for_enabled_stream() {

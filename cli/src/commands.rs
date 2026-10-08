@@ -161,6 +161,7 @@ pub fn is_top_level_command(value: &str) -> bool {
             | "react"
             | "vitals"
             | "web-vitals"
+            | "gc"
             | "a11y"
             | "pushstate"
             | "removeinitscript"
@@ -1978,6 +1979,9 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
         // === React (requires `open --enable react-devtools`) ===
         "react" => parse_react(&rest, &id),
 
+        // === Forced garbage collection (memory measurements) ===
+        "gc" => Ok(json!({ "id": id, "action": "gc" })),
+
         // === Core Web Vitals + hydration ===
         "vitals" | "web-vitals" => {
             let mut cmd = json!({ "id": id, "action": "vitals" });
@@ -3246,6 +3250,8 @@ fn parse_set(rest: &[&str], id: &str) -> Result<Value, ParseError> {
         "geo",
         "geolocation",
         "offline",
+        "network",
+        "cpu",
         "headers",
         "credentials",
         "auth",
@@ -3323,6 +3329,26 @@ fn parse_set(rest: &[&str], id: &str) -> Result<Value, ParseError> {
                 .unwrap_or(true);
             Ok(json!({ "id": id, "action": "offline", "offline": off }))
         }
+        Some("network") => parse_set_network(&rest[1..], id),
+        Some("cpu") => {
+            const USAGE: &str = "set cpu <rate|off> (rate >= 1, e.g. 4 for a 4x slowdown)";
+            let value = rest.get(1).ok_or_else(|| ParseError::MissingArguments {
+                context: "set cpu".to_string(),
+                usage: USAGE,
+            })?;
+            let rate = match *value {
+                "off" | "false" => 1.0,
+                v => v
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|r| r.is_finite() && *r >= 1.0)
+                    .ok_or_else(|| ParseError::InvalidValue {
+                        message: format!("Invalid CPU throttling rate: {}", v),
+                        usage: USAGE,
+                    })?,
+            };
+            Ok(json!({ "id": id, "action": "cpu_throttle", "rate": rate }))
+        }
         Some("headers") => {
             let headers_json = rest.get(1).ok_or_else(|| ParseError::MissingArguments {
                 context: "set headers".to_string(),
@@ -3370,9 +3396,73 @@ fn parse_set(rest: &[&str], id: &str) -> Result<Value, ParseError> {
         }),
         None => Err(ParseError::MissingArguments {
             context: "set".to_string(),
-            usage: "set <viewport|device|geo|offline|headers|credentials|media> [args...]",
+            usage:
+                "set <viewport|device|geo|offline|network|cpu|headers|credentials|media> [args...]",
         }),
     }
+}
+
+/// Parse `set network <preset|off>` or
+/// `set network <latency-ms> <download-kbps> [upload-kbps]`.
+///
+/// Custom throughput is given in kilobits per second, like the DevTools
+/// custom profile, and sent to the daemon in bytes per second. Throughput must
+/// be above 0: Chrome treats 0 as unlimited, which is not throttling.
+fn parse_set_network(args: &[&str], id: &str) -> Result<Value, ParseError> {
+    use crate::native::network::NetworkThrottle;
+
+    const USAGE: &str =
+        "set network <3g|slow-4g|fast-4g|off> | <latency-ms> <download-kbps> [upload-kbps]";
+    let first = args.first().ok_or_else(|| ParseError::MissingArguments {
+        context: "set network".to_string(),
+        usage: USAGE,
+    })?;
+    if matches!(*first, "off" | "false") {
+        return Ok(json!({ "id": id, "action": "network_throttle", "throttle": null }));
+    }
+    let throttle = if let Some(preset) = NetworkThrottle::preset(first) {
+        preset
+    } else {
+        let number = |s: &str, min_exclusive: Option<f64>| {
+            s.parse::<f64>()
+                .ok()
+                .filter(|v| v.is_finite() && *v >= 0.0)
+                .filter(|v| min_exclusive.is_none_or(|min| *v > min))
+                .ok_or_else(|| ParseError::InvalidValue {
+                    message: format!(
+                        "Unknown network preset or invalid number: {} (throughput must be above 0)",
+                        s
+                    ),
+                    usage: USAGE,
+                })
+        };
+        let latency_ms = number(first, None)?;
+        let download_kbps = number(
+            args.get(1).ok_or_else(|| ParseError::MissingArguments {
+                context: "set network".to_string(),
+                usage: USAGE,
+            })?,
+            Some(0.0),
+        )?;
+        let upload_kbps = match args.get(2) {
+            Some(s) => number(s, Some(0.0))?,
+            None => download_kbps,
+        };
+        NetworkThrottle {
+            latency_ms,
+            download_bytes_per_sec: download_kbps * 1000.0 / 8.0,
+            upload_bytes_per_sec: upload_kbps * 1000.0 / 8.0,
+        }
+    };
+    Ok(json!({
+        "id": id,
+        "action": "network_throttle",
+        "throttle": {
+            "latencyMs": throttle.latency_ms,
+            "downloadBytesPerSec": throttle.download_bytes_per_sec,
+            "uploadBytesPerSec": throttle.upload_bytes_per_sec,
+        },
+    }))
 }
 
 /// Parse network interception, request inspection, and HAR recording commands.
@@ -5569,6 +5659,88 @@ mod tests {
         assert_eq!(cmd["action"], "emulatemedia");
         assert_eq!(cmd["colorScheme"], "dark");
         assert_eq!(cmd["reducedMotion"], "no-preference");
+    }
+
+    #[test]
+    fn test_set_cpu() {
+        let cmd = parse_command(&args("set cpu 4"), &default_flags()).unwrap();
+        assert_eq!(cmd["action"], "cpu_throttle");
+        assert_eq!(cmd["rate"], 4.0);
+    }
+
+    #[test]
+    fn test_set_cpu_off_resets_rate_to_one() {
+        let cmd = parse_command(&args("set cpu off"), &default_flags()).unwrap();
+        assert_eq!(cmd["rate"], 1.0);
+    }
+
+    #[test]
+    fn test_set_cpu_rejects_rate_below_one() {
+        for bad in ["0.5", "0", "-2", "fast"] {
+            let result = parse_command(&args(&format!("set cpu {bad}")), &default_flags());
+            assert!(
+                matches!(result, Err(ParseError::InvalidValue { .. })),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_set_network_preset_matches_devtools() {
+        let cmd = parse_command(&args("set network slow-4g"), &default_flags()).unwrap();
+        assert_eq!(cmd["action"], "network_throttle");
+        assert_eq!(cmd["throttle"]["latencyMs"], 562.5);
+        assert_eq!(cmd["throttle"]["downloadBytesPerSec"], 180_000.0);
+        assert_eq!(cmd["throttle"]["uploadBytesPerSec"], 84_375.0);
+    }
+
+    #[test]
+    fn test_set_network_custom_converts_kbps_to_bytes() {
+        let cmd = parse_command(&args("set network 150 1600 750"), &default_flags()).unwrap();
+        assert_eq!(cmd["throttle"]["latencyMs"], 150.0);
+        assert_eq!(cmd["throttle"]["downloadBytesPerSec"], 200_000.0);
+        assert_eq!(cmd["throttle"]["uploadBytesPerSec"], 93_750.0);
+    }
+
+    #[test]
+    fn test_set_network_custom_upload_defaults_to_download() {
+        let cmd = parse_command(&args("set network 100 800"), &default_flags()).unwrap();
+        assert_eq!(cmd["throttle"]["uploadBytesPerSec"], 100_000.0);
+    }
+
+    #[test]
+    fn test_set_network_off_clears_throttle() {
+        let cmd = parse_command(&args("set network off"), &default_flags()).unwrap();
+        assert_eq!(cmd["action"], "network_throttle");
+        assert!(cmd["throttle"].is_null());
+    }
+
+    #[test]
+    fn test_set_network_rejects_unknown_preset() {
+        let result = parse_command(&args("set network 5g"), &default_flags());
+        assert!(matches!(result, Err(ParseError::InvalidValue { .. })));
+        let result = parse_command(&args("set network 100"), &default_flags());
+        assert!(matches!(result, Err(ParseError::MissingArguments { .. })));
+    }
+
+    /// Chrome treats 0 throughput as unlimited, so 0 kbps is not a throttle.
+    #[test]
+    fn test_set_network_rejects_zero_throughput() {
+        for bad in ["100 0", "100 800 0", "0 0"] {
+            let result = parse_command(&args(&format!("set network {bad}")), &default_flags());
+            assert!(
+                matches!(result, Err(ParseError::InvalidValue { .. })),
+                "{bad}"
+            );
+        }
+        let cmd = parse_command(&args("set network 0 800"), &default_flags()).unwrap();
+        assert_eq!(cmd["throttle"]["latencyMs"], 0.0);
+    }
+
+    #[test]
+    fn test_gc() {
+        let cmd = parse_command(&args("gc"), &default_flags()).unwrap();
+        assert_eq!(cmd["action"], "gc");
     }
 
     #[test]

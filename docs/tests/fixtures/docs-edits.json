@@ -8,6 +8,18 @@
       {
         "from": "# Clear CA trust retained by the running session",
         "to": "# Clear CA trust retained by the running session\n--use-system-ca          # Use the OS trust store for CLI requests (read, install, upgrade, doctor)"
+      },
+      {
+        "from": "agent-browser set offline [on|off]    # Toggle offline mode",
+        "to": "agent-browser set offline [on|off]    # Toggle offline mode\nagent-browser set network <preset|off> # Throttle network (3g, slow-4g, fast-4g)\nagent-browser set network <ms> <down-kbps> [up-kbps]  # Custom throttling\nagent-browser set cpu <rate|off>      # Slow down the page CPU (4 = 4x)"
+      },
+      {
+        "from": "agent-browser vitals [url] [--json]                # LCP/CLS/TTFB/FCP/INP + hydration",
+        "to": "agent-browser vitals [url] [--json]                # LCP/CLS/TTFB/FCP/INP + hydration\nagent-browser gc                                   # Force GC, print JS heap size"
+      },
+      {
+        "from": "React, vitals, sessions",
+        "to": "React, vitals, CPU and network throttling, garbage collection, sessions"
       }
     ],
     "/configuration": [

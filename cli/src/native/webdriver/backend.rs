@@ -131,6 +131,11 @@ pub const WEBDRIVER_UNSUPPORTED_ACTIONS: &[&str] = &[
     "network",
     "har_start",
     "har_stop",
+    // Emulation.setCPUThrottlingRate, Network.emulateNetworkConditions and
+    // HeapProfiler.collectGarbage have no WebDriver equivalent.
+    "cpu_throttle",
+    "network_throttle",
+    "gc",
 ];
 
 #[cfg(test)]
@@ -142,6 +147,9 @@ mod tests {
         assert!(WEBDRIVER_UNSUPPORTED_ACTIONS.contains(&"a11y"));
         assert!(WEBDRIVER_UNSUPPORTED_ACTIONS.contains(&"screencast_start"));
         assert!(WEBDRIVER_UNSUPPORTED_ACTIONS.contains(&"trace_start"));
+        for action in ["cpu_throttle", "network_throttle", "gc"] {
+            assert!(WEBDRIVER_UNSUPPORTED_ACTIONS.contains(&action), "{action}");
+        }
         assert!(!WEBDRIVER_UNSUPPORTED_ACTIONS.contains(&"navigate"));
     }
 }
